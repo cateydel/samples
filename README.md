@@ -1,2 +1,2 @@
-# odds-and-sods
+# samples
 Code samples representative of past work.
