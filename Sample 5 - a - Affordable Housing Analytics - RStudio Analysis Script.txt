@@ -1,0 +1,205 @@
+## This script regresses percentile ranks of delinquency status against percentile 
+## ranks of borrowers’ FICO scores, borrowers’ combined loan-to-value ratios, 
+## borrowers’ debt-to-income ratios, and properties’ coastal state status, for the 
+## mortgages in Freddie Mac’s Home Possible program and mortgages that fit a 
+## similar risk profile outside the Home Possible Program. Mortgage data has been 
+## provided by Milliman in an Apache Parquet file called all_data.parquet. 
+## Properties are assigned a coastal state status flag of 1 if they are in states 
+## on the Gulf of Mexico or Atlantic Ocean coastline, or in HI, WV, DC, PA, or VT; 
+## they are assigned 0 otherwise. Delinquency statuses are numeric and have 
+## historically ranged from 0 to 6, where 0 denotes non-delinquency. For FICO 
+## scores, the percentile ranks converge to 100% for high scores and 0% for low 
+## scores; for CLTV ratios, DTI ratios, coastal state statuses, and delinquency 
+## statuses, the percentile ranks converge to 100% for low scores and 0% for high 
+## scores. Replicated values receive the average of the percentiles the values 
+## would have been assigned had they been distinct – for example, if 60% of the 
+## FICO scores in the data were 680 and 40% of the FICO scores were 770, then all 
+## the 680 FICO scores would be assigned the 30th percentile (the average or 
+## midpoint of the 0 and 60th percentiles), and all the 770 FICO scores would be
+## assigned the 80th percentile (the average of the 60th and 100th percentiles).
+##
+## The regression is a least-squares fit that determines coefficients and an
+## intercept for y = m[1]x[1] + m[2]x[2] + m[3]x[3] + m[4]x[4] + b:
+## 
+## y: delinquency status percentile
+## x[1]: FICO score percentile
+## x[2]: DTI ratio percentile
+## x[3]: CLTV ratio percentile
+## x[4]: Coastal state status percentile
+## 
+## Protecdiv’s mortgage risk scoring is based on the weights m[1], m[2], m[3], 
+## and m[4] that result from the least-squares regression:
+## 
+## w[n] = m[n] / (m[1]+m[2]+m[3]+m[4]), n ∈ {1, 2, 3, 4}
+
+
+## Import the dplyr and broom libraries
+
+library(dplyr)
+library(broom)
+
+
+## Install the tidyverse and dev tools packages, if they aren't already imported 
+
+packages = installed.packages()
+packages = packages[, "Package"]
+if (!"tidyverse" %in% packages) {
+  install.packages("tidyverse")
+}
+if (!"devtools" %in% packages) {
+  install.packages("devtools")
+}
+
+
+## Import the arrow library
+
+Sys.setenv(LIBARROW_MINIMAL = FALSE); install.packages("arrow", type = "source")
+#include "arrow/util/bit_util.h"
+library(arrow)
+
+
+## Import Milliman's mortgage data and the BEA's metropolitan statistical
+## area-level income data
+
+all_data <- read_parquet("/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/From Milliman/all_data.parquet", as_tibble = TRUE)
+CAINC1_MSA_1969_2019 <- read.csv("/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Bureau of Economic Affairs/CAINC1/CAINC1_MSA_1969_2019.csv")
+
+
+## Isolate CY 2019 per capita income in the BEA data
+
+msaPerCapitaIncome <- CAINC1_MSA_1969_2019 %>% filter(grepl('Dollars', Unit))
+msaPerCapitaIncome_2019 <- msaPerCapitaIncome %>% mutate(GeoFIPSChar=gsub(" ","",as.character(GeoFIPS))) %>% mutate(GeoFIPSChar4=substr(GeoFIPSChar,1,4)) %>% select(c(GeoFIPS, GeoFIPSChar, GeoFIPSChar4, X2019))
+
+
+## Build a table of the most current records (i.e., the records with the most
+## mature loan ages) for each mortgage. Milliman's file is a compilation of
+## Freddie Mac's mortgage performance files, which show each mortgage's monthly
+## development. We don't need to see all the development, just the latest.
+
+all_data_selCols <- all_data %>% mutate(msaLength = nchar(MSA)) %>% select(c(LoanID, State, LoanAge, MSA, CLTV, FICO, DTI, UPB, DelqStatus, delq_status, minority_perc, msaLength)) %>% mutate(MSA4=substr(MSA,1,4))
+all_data_selCols_maxAge <- all_data_selCols %>% group_by(LoanID) %>% summarize(maxAge = max(LoanAge, na.rm=TRUE))
+all_data_selCols_latest <- inner_join(all_data_selCols, all_data_selCols_maxAge, by = c("LoanID" = "LoanID", "LoanAge" = "maxAge"))
+
+
+## Join the latest-records table with the MSA-level per capita income table
+
+all_data_selCols_latest_wInc <- left_join(all_data_selCols_latest, msaPerCapitaIncome_2019, by = c("MSA4" = "GeoFIPSChar4")) %>% mutate(mmUpbTimesAvgInc = 0.000001*UPB*X2019) %>% mutate(upb_nonnullAvgInc=UPB*as.integer(!is.na(X2019))) %>% mutate(mmUpbTimesMinPct = 0.000001*UPB*minority_perc) %>% mutate(upb_nonnullMinPct=UPB*as.integer(!is.na(minority_perc)))
+
+
+## Calculate UPB-weighted averages of minority population percentages and per
+## capita income for the full portfolio
+
+all_data_selCols_avgInc <- all_data_selCols_latest_wInc %>% summarize( sumUpb = sum(upb_nonnullAvgInc, na.rm=TRUE), sumMmUpbTimesInc = sum(mmUpbTimesAvgInc, na.rm=TRUE), sumUpb_MinPct = sum(upb_nonnullMinPct, na.rm=TRUE), sumMmUpbTimesMinPct = sum(mmUpbTimesMinPct, na.rm=TRUE)) %>% mutate(avgInc = (sumMmUpbTimesInc/sumUpb)*1000000) %>% mutate(avgMinPct = (sumMmUpbTimesMinPct/sumUpb_MinPct)*1000000)
+
+
+## For mortgages in MSAs that don't have a reported MSA-level per capita income,
+## use the portfolio average as a placeholder
+
+all_data_selCols_upd0 <- inner_join(filter(all_data_selCols_latest_wInc, is.na(X2019)), all_data_selCols_avgInc, by=character()) %>% select(c(LoanID, State, LoanAge, MSA, CLTV, FICO, DTI, UPB, DelqStatus, delq_status, minority_perc, avgInc))
+all_data_selCols_upd1 <- inner_join(filter(all_data_selCols_latest_wInc, !is.na(X2019)), all_data_selCols_avgInc, by=character()) %>% select(c(LoanID, State, LoanAge, MSA, CLTV, FICO, DTI, UPB, DelqStatus, delq_status, minority_perc, X2019))
+all_data_selCols_upd1 <- rename(all_data_selCols_upd1, avgInc=X2019)
+all_data_selCols_latest_wInc <- bind_rows(all_data_selCols_upd1, all_data_selCols_upd0)
+
+
+## For mortgages in MSAs that don't have a reported minority population percentage,
+## use the portfolio average as a placeholder
+
+all_data_selCols_upd0 <- inner_join(filter(all_data_selCols_latest_wInc, is.na(minority_perc)), rename(all_data_selCols_avgInc, avg_inc=avgInc), by=character()) %>% select(c(LoanID, State, LoanAge, MSA, CLTV, FICO, DTI, UPB, DelqStatus, delq_status, avgInc, avgMinPct))
+all_data_selCols_upd1 <- inner_join(filter(all_data_selCols_latest_wInc, !is.na(minority_perc)), rename(all_data_selCols_avgInc, avg_inc=avgInc), by=character()) %>% select(c(LoanID, State, LoanAge, MSA, CLTV, FICO, DTI, UPB, DelqStatus, delq_status, avgInc, minority_perc))
+all_data_selCols_upd0 <- rename(all_data_selCols_upd0, minority_perc=avgMinPct)
+all_data_selCols_latest_wInc <- bind_rows(all_data_selCols_upd1, all_data_selCols_upd0)
+
+
+## Define the coastal state status flag
+
+all_data_selCols_latest_wInc <- all_data_selCols_latest_wInc %>%
+  mutate(coastalState = case_when(
+    State=="HI" | State=="TX" | State=="LA" | State=="MS" | State=="AL" | State=="FL" | State=="GA" | State=="SC" | State=="NC" | State=="VA" | State=="WV" | State=="DC" | State=="MD" | State=="DE" | State=="NJ" | State=="PA" | State=="NY" | State=="CT" | State=="RI" | State=="MA" | State=="VT" | State=="NH" | State=="ME" ~ 1,
+    State!="HI" & State!="TX" & State!="LA" & State!="MS" & State!="AL" & State!="FL" & State!="GA" & State!="SC" & State!="NC" & State!="VA" & State!="WV" & State!="DC" & State!="MD" & State!="DE" & State!="NJ" & State!="PA" & State!="NY" & State!="CT" & State!="RI" & State!="MA" & State!="VT" & State!="NH" & State!="ME" ~ 0
+  ))
+
+
+## Compute the FICO, coastal state status, CLTV, DTI, and delinquency
+## status percentiles
+
+rankWork_DTI <- all_data_selCols_latest_wInc %>% select(c(LoanID, DTI))
+rankWork_pctiles_DTI <- inner_join(rankWork_DTI %>% mutate(rk_DTI=rank(DTI)), rankWork_DTI %>% group_by(DTI) %>% summarize(ct_DTI=n()) %>% mutate(nr=nrow(rankWork_DTI)), by="DTI") %>% mutate(pctRk_DTI=1-rk_DTI/(1+nr))
+
+rankWork_FICO <- all_data_selCols_latest_wInc %>% select(c(LoanID, FICO))
+rankWork_pctiles_FICO <- inner_join(rankWork_FICO %>% mutate(rk_FICO=rank(FICO)), rankWork_FICO %>% group_by(FICO) %>% summarize(ct_FICO=n()) %>% mutate(nr=nrow(rankWork_FICO)), by="FICO") %>% mutate(pctRk_FICO=rk_FICO/(1+nr))
+
+rankWork_CLTV <- all_data_selCols_latest_wInc %>% select(c(LoanID, CLTV))
+rankWork_pctiles_CLTV <- inner_join(rankWork_CLTV %>% mutate(rk_CLTV=rank(CLTV)), rankWork_CLTV %>% group_by(CLTV) %>% summarize(ct_CLTV=n()) %>% mutate(nr=nrow(rankWork_CLTV)), by="CLTV") %>% mutate(pctRk_CLTV=1-rk_CLTV/(1+nr))
+
+rankWork_coastalState <- all_data_selCols_latest_wInc %>% select(c(LoanID, coastalState))
+rankWork_pctiles_coastalState <- inner_join(rankWork_coastalState %>% mutate(rk_coastalState=rank(coastalState)), rankWork_coastalState %>% group_by(coastalState) %>% summarize(ct_coastalState=n()) %>% mutate(nr=nrow(rankWork_coastalState)), by="coastalState") %>% mutate(pctRk_coastalState=1-rk_coastalState/(1+nr))
+
+rankWork_delq_status <- all_data_selCols_latest_wInc %>% select(c(LoanID, delq_status))
+rankWork_pctiles_delq_status <- inner_join(rankWork_delq_status %>% mutate(rk_delq_status=rank(delq_status)), rankWork_delq_status %>% group_by(delq_status) %>% summarize(ct_delq_status=n()) %>% mutate(nr=nrow(rankWork_delq_status)), by="delq_status") %>% mutate(pctRk_delq_status=1-rk_delq_status/(1+nr))
+
+all_data_selCols_pctiles <- inner_join(inner_join(inner_join(rankWork_pctiles_delq_status, rankWork_pctiles_FICO %>% select(!c(nr)), by="LoanID"), rankWork_pctiles_DTI %>% select(!c(nr)), by="LoanID"), inner_join(rankWork_pctiles_CLTV, rankWork_pctiles_coastalState %>% select(!c(nr)), by="LoanID"))
+
+
+## Regress the FICO, coastal state status, CLTV, and DTI percentiles against the
+## delinquency status percentiles
+
+linear_model_test <- lm(pctRk_delq_status ~ pctRk_FICO + pctRk_coastalState + pctRk_CLTV + pctRk_DTI, data=all_data_selCols_pctiles)
+summary(linear_model_test)
+
+
+## Check 2,000 random records
+
+hp_and_comp_percentiles_2000records <- sample_n(all_data_selCols_pctiles, 2000)
+write.csv(hp_and_comp_percentiles_2000records, file = "/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Milliman Data Exploration/hp_and_comp_percentiles_2000records.csv")
+
+
+## Build a table of risk score weights
+
+tidy_linear_model_test <- tidy(linear_model_test)
+tidy_linear_model_test_weights <- filter(tidy_linear_model_test, term!="(Intercept)") %>% mutate(coeffWt=round(100*estimate/sum(estimate),1))
+
+
+## Calculate risk scores for each mortgages
+
+all_data_riskScoresByLoanID <- inner_join(inner_join(inner_join(all_data_selCols_pctiles, filter(tidy_linear_model_test_weights, term=='pctRk_FICO'), by=character()) %>% mutate(RS1=pctRk_FICO*coeffWt) %>% select(c(LoanID, RS1)), inner_join(all_data_selCols_pctiles, filter(tidy_linear_model_test_weights, term=='pctRk_DTI'), by=character()) %>% mutate(RS2=pctRk_DTI*coeffWt) %>% select(c(LoanID, RS2)), by="LoanID"), inner_join(inner_join(all_data_selCols_pctiles, filter(tidy_linear_model_test_weights, term=='pctRk_CLTV'), by=character()) %>% mutate(RS3=pctRk_CLTV*coeffWt) %>% select(c(LoanID, RS3)), inner_join(all_data_selCols_pctiles, filter(tidy_linear_model_test_weights, term=='pctRk_coastalState'), by=character()) %>% mutate(RS4=pctRk_coastalState*coeffWt) %>% select(c(LoanID, RS4)), by="LoanID"), by="LoanID") %>% mutate(riskScore=round(RS1+RS2+RS3+RS4,1))
+
+
+## Build a dataframe of mortgages with 40+ risk scores, and either <$48,000 average
+## MSA-level incomes or 63%+ minority populations  
+
+data_highRiskScore_and_lowIncOrHighMino <- inner_join(filter(all_data_riskScoresByLoanID, riskScore>=40), filter(all_data_selCols_latest_wInc, avgInc<48000 | minority_perc>=0.63), by="LoanID")
+
+
+## Calculate UPB-weighted delinquency probabilities by risk score
+
+data_delinquenciesByRiskScore <- data_highRiskScore_and_lowIncOrHighMino %>% mutate(upbTimesDelqSign=UPB*sign(delq_status)) %>% group_by(riskScore) %>% summarize(UPB = sum(UPB), upbTimesDelqSign=sum(upbTimesDelqSign), delqRatio=sum(upbTimesDelqSign)/sum(UPB))
+write.csv(data_delinquenciesByRiskScore, file = "/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Milliman Data Exploration/data_delinquenciesByRiskScore.csv")
+
+
+## Compute pairwise composite percentiles
+
+all_data_selCols_pctiles <- all_data_selCols_pctiles %>% mutate(comp_FICO_DTI = qnorm((pnorm(pctRk_FICO)+pnorm(pctRk_DTI))/2), comp_FICO_CLTV = qnorm((pnorm(pctRk_FICO)+pnorm(pctRk_CLTV))/2), comp_FICO_coastalState = qnorm((pnorm(pctRk_FICO)+pnorm(pctRk_coastalState))/2), comp_DTI_CLTV = qnorm((pnorm(pctRk_DTI)+pnorm(pctRk_CLTV))/2), comp_DTI_coastalState = qnorm((pnorm(pctRk_DTI)+pnorm(pctRk_coastalState))/2), comp_CLTV_coastalState = qnorm((pnorm(pctRk_CLTV)+pnorm(pctRk_coastalState))/2))
+
+linear_model_test_wCorr <- lm(pctRk_delq_status ~ pctRk_FICO + pctRk_coastalState + pctRk_CLTV + pctRk_DTI + comp_FICO_DTI + comp_FICO_CLTV + comp_FICO_coastalState + comp_DTI_CLTV + comp_DTI_coastalState + comp_CLTV_coastalState, data=all_data_selCols_pctiles)
+
+
+## Coefficients:
+##            (Intercept)              pctRk_FICO      pctRk_coastalState              pctRk_CLTV  
+##               0.465677                0.017101                0.002408                0.004848  
+##              pctRk_DTI          comp_FICO_CLTV  comp_FICO_coastalState  
+##               0.015514                0.013195                0.016109  
+
+
+## Send quantile tables to CSV
+
+write.csv(quantile(all_data_selCols_latest_wInc$CLTV, c(0.00, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.60, 0.61, 0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.70, 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.00)), file = "/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Milliman Data Exploration/quantiles_CLTV.csv")
+
+write.csv(quantile(all_data_selCols_latest_wInc$DTI, c(0.00, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.60, 0.61, 0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.70, 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.00)), file = "/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Milliman Data Exploration/quantiles_DTI.csv")
+
+write.csv(quantile(all_data_selCols_latest_wInc$FICO, c(0.00, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.60, 0.61, 0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.70, 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.00)), file = "/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Milliman Data Exploration/quantiles_FICO.csv")
+
+write.csv(quantile(all_data_selCols_latest_wInc$coastalState, c(0.00, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.60, 0.61, 0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.70, 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.80, 0.81, 0.82, 0.83, 0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.00)), file = "/Users/cateydel/Documents/Protecdiv/Clients and Prospects/Freddie Mac/Milliman Data Exploration/quantiles_coastalState.csv")
+
+
+
+all_data_selCols_latest_wInc %>% group_by(MSA) %>% summarize(minMinoPct = min(minority_perc, na.rm=TRUE), maxMinoPct = max(minority_perc, na.rm=TRUE))
